@@ -16,6 +16,7 @@ export async function proxy(request: NextRequest) {
     publicRoutes.includes(pathname) ||
     pathname.startsWith("/api/auth") ||
     pathname.startsWith("/api/public/") ||
+    pathname === "/api/webhooks/whatsapp" ||
     /^\/api\/forms\/[^/]+\/submit$/.test(pathname) ||
     pathname.startsWith("/_next") ||
     pathname.startsWith("/favicon.ico");
