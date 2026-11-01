@@ -40,6 +40,7 @@ export async function GET() {
 
     if (membershipError) {
       console.error("Membership lookup error:", membershipError);
+
       return NextResponse.json(
         { success: false, error: "Unable to load organization" },
         { status: 500 }
@@ -68,16 +69,21 @@ export async function GET() {
             organization_id: profile.organization_id,
             role: profile.role || "agent",
             status: "active",
-            organizations: organization,
+            organizations: [organization],
           };
         }
       }
     }
 
+    const organizationData = organizationMembership?.organizations;
+
     return NextResponse.json({
       success: true,
       user,
-      organization: organizationMembership?.organizations ?? null,
+      organization:
+        Array.isArray(organizationData)
+          ? organizationData[0] ?? null
+          : organizationData ?? null,
       membership: organizationMembership
         ? {
             organization_id: organizationMembership.organization_id,
