@@ -1,20 +1,30 @@
-import { getCurrentUser } from "./auth";
-import { supabaseAdmin } from "./supabase/admin";
+import { createClient } from "@/lib/supabase/server";
+import { supabaseAdmin } from "@/lib/supabase/admin";
 
 export async function getOrganization() {
-  const user = await getCurrentUser();
+  const supabase = await createClient();
 
-  if (!user) {
-    throw new Error("User not logged in");
+  const {
+    data: { user },
+    error,
+  } = await supabase.auth.getUser();
+
+  if (error || !user) {
+    throw new Error("User not authenticated");
   }
 
-  const { data, error } = await supabaseAdmin
+  const {
+    data: profile,
+    error: profileError,
+  } = await supabaseAdmin
     .from("user_profiles")
     .select("organization_id")
     .eq("id", user.id)
     .single();
 
-  if (error) throw error;
+  if (profileError || !profile) {
+    throw new Error("Organization not found");
+  }
 
-  return data.organization_id;
+  return profile.organization_id;
 }

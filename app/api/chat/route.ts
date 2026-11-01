@@ -1,52 +1,72 @@
 import { NextResponse } from "next/server";
 import { openai } from "@/lib/openai";
-import { searchKnowledge } from "@/lib/searchKnowledge";
+import { searchKnowledge } from "@/lib/knowledge/search";
 import { supabaseAdmin } from "@/lib/supabase/admin";
+import { detectIntent } from "@/lib/ai/intent";
 
 export async function POST(req: Request) {
   try {
     const { agentId, message } = await req.json();
+    const intent = detectIntent(message);
 
-    // Get the agent
-    const { data: agent, error } = await supabaseAdmin
+    // Get Agent
+    const { data: agent, error: agentError } = await supabaseAdmin
       .from("agents")
-      .select("organization_id, system_prompt")
+      .select("system_prompt")
       .eq("id", agentId)
       .single();
 
-    if (error || !agent) {
+    if (agentError || !agent) {
       return NextResponse.json(
         { error: "Agent not found" },
         { status: 404 }
       );
     }
 
-    // Search knowledge
-    const knowledge = await searchKnowledge(
+    // Get Knowledge Base
+    const { data: knowledgeBase, error: kbError } = await supabaseAdmin
+      .from("knowledge_bases")
+      .select("id")
+      .eq("agent_id", agentId)
+      .single();
+
+    if (kbError || !knowledgeBase) {
+      return NextResponse.json(
+        { error: "Knowledge Base not found" },
+        { status: 404 }
+      );
+    }
+
+    // Search the Knowledge Base
+    const chunks = await searchKnowledge(
+      knowledgeBase.id,
       message,
-      agent.organization_id
+      5
     );
 
-    const context = knowledge
-      ?.map((item: any) => item.content)
-      .join("\n\n") || "";
+    const context = chunks
+      .map((chunk: any) => chunk.content)
+      .join("\n\n");
+      
 
     // Ask OpenAI
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
+      temperature: 0.2,
       messages: [
         {
           role: "system",
           content: `
 ${agent.system_prompt}
 
-Use ONLY the knowledge below.
+You are an AI assistant that answers ONLY using the supplied knowledge.
+
+If the answer is not present in the knowledge, reply exactly:
+
+"I don't have that information."
 
 Knowledge:
 ${context}
-
-If the answer is not available, reply:
-"I don't have that information."
 `,
         },
         {
@@ -59,13 +79,16 @@ If the answer is not available, reply:
     return NextResponse.json({
       answer: completion.choices[0].message.content,
     });
-
   } catch (err) {
     console.error(err);
 
     return NextResponse.json(
-      { error: "Internal Server Error" },
-      { status: 500 }
+      {
+        error: "Internal Server Error",
+      },
+      {
+        status: 500,
+      }
     );
   }
 }
