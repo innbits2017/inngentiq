@@ -1,4 +1,5 @@
 
+import { createHash } from "node:crypto";
 import { decryptWhatsAppToken } from "@/lib/whatsapp/encryption";
 
 interface SendWhatsAppMessageParams {
@@ -54,21 +55,33 @@ export async function sendWhatsAppMessage({
     );
   }
 
-  // Step 2: Log safe production diagnostics.
-  // Never log the actual access token or encryption key.
-  console.log("Production WhatsApp token diagnostic:", {
-    tokenDecrypted: Boolean(accessToken),
+  // Step 2: Generate a safe token fingerprint.
+  // Never log the actual token or encryption key.
+  const tokenFingerprint = createHash("sha256")
+    .update(accessToken)
+    .digest("hex");
+
+  console.log(
+    "WhatsApp production token fingerprint:",
+    {
+      fingerprint: tokenFingerprint,
+      tokenLength: accessToken.length,
+    }
+  );
+
+  // Step 3: Production configuration diagnostics.
+  const apiVersion =
+    process.env.META_GRAPH_API_VERSION;
+
+  console.log("Production WhatsApp configuration:", {
+    tokenDecrypted: true,
     tokenLength: accessToken.length,
     phoneNumberId,
     encryptionKeyConfigured: Boolean(
       process.env.WHATSAPP_TOKEN_ENCRYPTION_KEY
     ),
-    apiVersion: process.env.META_GRAPH_API_VERSION,
+    apiVersion,
   });
-
-  // Step 3: Validate Graph API version.
-  const apiVersion =
-    process.env.META_GRAPH_API_VERSION;
 
   if (
     !apiVersion ||
@@ -115,17 +128,14 @@ export async function sendWhatsAppMessage({
     (await response.json()) as WhatsAppSendResponse;
 
   if (!response.ok) {
-    console.error(
-      "WhatsApp API request failed:",
-      {
-        status: response.status,
-        code: result.error?.code,
-        subcode: result.error?.error_subcode,
-        type: result.error?.type,
-        message: result.error?.message,
-        fbtraceId: result.error?.fbtrace_id,
-      }
-    );
+    console.error("WhatsApp API request failed:", {
+      status: response.status,
+      code: result.error?.code,
+      subcode: result.error?.error_subcode,
+      type: result.error?.type,
+      message: result.error?.message,
+      fbtraceId: result.error?.fbtrace_id,
+    });
 
     throw new Error(
       result.error?.message ||
@@ -137,15 +147,6 @@ export async function sendWhatsAppMessage({
   const messageId = result.messages?.[0]?.id;
 
   if (!messageId) {
-    console.error(
-      "WhatsApp API returned no message ID:",
-      {
-        phoneNumberId,
-        responseStatus: response.status,
-        responseData: result,
-      }
-    );
-
     throw new Error(
       "WhatsApp API did not return a message ID."
     );
