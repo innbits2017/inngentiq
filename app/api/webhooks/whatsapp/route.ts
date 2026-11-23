@@ -73,7 +73,7 @@ function verifySignature(
   );
 }
 
-// Meta webhook subscription verification.
+// Meta webhook verification.
 export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
 
@@ -104,8 +104,12 @@ export async function GET(request: NextRequest) {
   );
 }
 
-// Find the account, workspace and default AI agent.
+// Find WhatsApp account and default agent.
 async function getWhatsAppAccount(phoneNumberId: string) {
+  console.log("WhatsApp account lookup started:", {
+    incomingPhoneNumberId: phoneNumberId,
+  });
+
   const { data: account, error: accountError } =
     await supabaseAdmin
       .from("whatsapp_business_accounts")
@@ -119,12 +123,24 @@ async function getWhatsAppAccount(phoneNumberId: string) {
       .eq("phone_number_id", phoneNumberId)
       .maybeSingle();
 
+  console.log("WhatsApp account lookup result:", {
+    found: Boolean(account),
+    connectionStatus: account?.connection_status ?? null,
+    matchedPhoneNumberId: account?.phone_number_id ?? null,
+    error: accountError?.message ?? null,
+    errorCode: accountError?.code ?? null,
+  });
+
   if (accountError) {
-    throw accountError;
+    throw new Error(
+      `WhatsApp account database lookup failed: ${accountError.message}`
+    );
   }
 
   if (!account || account.connection_status !== "connected") {
-    throw new Error("WhatsApp account not found or disconnected.");
+    throw new Error(
+      `WhatsApp account not found or disconnected. Incoming Phone Number ID: ${phoneNumberId}`
+    );
   }
 
   const { data: organization, error: organizationError } =
@@ -135,7 +151,9 @@ async function getWhatsAppAccount(phoneNumberId: string) {
       .single();
 
   if (organizationError || !organization) {
-    throw new Error("WhatsApp workspace not found.");
+    throw new Error(
+      `WhatsApp workspace lookup failed: ${organizationError?.message || "Workspace not found"}`
+    );
   }
 
   const agentId = organization.default_whatsapp_agent_id;
@@ -154,16 +172,15 @@ async function getWhatsAppAccount(phoneNumberId: string) {
       .single();
 
   if (agentError || !agent) {
-    throw new Error("Default WhatsApp AI agent is unavailable.");
+    throw new Error(
+      `Default WhatsApp AI agent lookup failed: ${agentError?.message || "Agent unavailable"}`
+    );
   }
 
-  return {
-    account,
-    agent,
-  };
+  return { account, agent };
 }
 
-// Find or create the customer's WhatsApp conversation.
+// Find or create a customer conversation.
 async function getOrCreateConversation(params: {
   accountId: string;
   agentId: string;
@@ -220,13 +237,11 @@ async function getOrCreateConversation(params: {
   return created;
 }
 
-// Atomically claim a message for processing.
+// Atomically claim an incoming message.
 async function claimMessage(messageId: string) {
   const { data, error } = await supabaseAdmin
     .from("conversation_messages")
-    .update({
-      processing_status: "processing",
-    })
+    .update({ processing_status: "processing" })
     .eq("id", messageId)
     .eq("processing_status", "pending")
     .select("id")
@@ -239,12 +254,15 @@ async function claimMessage(messageId: string) {
   return Boolean(data);
 }
 
-// Process one incoming WhatsApp text message.
+// Process an incoming WhatsApp message.
 async function handleIncomingMessage(
   message: WhatsAppMessage,
   value: WhatsAppWebhookValue
 ) {
   if (message.type !== "text" || !message.text?.body?.trim()) {
+    console.log("Skipping unsupported or empty WhatsApp message:", {
+      messageType: message.type,
+    });
     return;
   }
 
@@ -276,7 +294,6 @@ async function handleIncomingMessage(
     visitorName,
   });
 
-  // Store the inbound message.
   const { data: insertedMessage, error: insertError } =
     await supabaseAdmin
       .from("conversation_messages")
@@ -290,15 +307,13 @@ async function handleIncomingMessage(
       .select("id")
       .single();
 
-  let inboundMessageId: string | null =
-    insertedMessage?.id || null;
+  let inboundMessageId = insertedMessage?.id || null;
 
   if (insertError) {
     if (insertError.code !== "23505") {
       throw insertError;
     }
 
-    // This Meta message was already received.
     const { data: existingMessage, error: existingError } =
       await supabaseAdmin
         .from("conversation_messages")
@@ -353,13 +368,11 @@ async function handleIncomingMessage(
     .update({
       last_message_at: now,
       updated_at: now,
-      visitor_name: visitorName || undefined,
+      ...(visitorName ? { visitor_name: visitorName } : {}),
     })
     .eq("id", conversation.id);
 
   try {
-    // Do not automatically reply during human handover
-    // or after the conversation has been resolved.
     if (
       conversation.human_handover ||
       conversation.status === "resolved"
@@ -372,7 +385,6 @@ async function handleIncomingMessage(
       return;
     }
 
-    // Generate the AI response using conversation history.
     const answer = await processWhatsAppMessage({
       agentId: agent.id,
       conversationId: conversation.id,
@@ -380,7 +392,6 @@ async function handleIncomingMessage(
       excludeMessageId: inboundMessageId,
     });
 
-    // Send the response through Meta Cloud API.
     const outgoingMessageId = await sendWhatsAppMessage({
       phoneNumberId: account.phone_number_id,
       encryptedAccessToken: account.access_token_encrypted,
@@ -388,7 +399,6 @@ async function handleIncomingMessage(
       message: answer,
     });
 
-    // Save the outgoing message in the existing Inbox.
     const { error: outgoingError } =
       await supabaseAdmin
         .from("conversation_messages")
@@ -401,13 +411,10 @@ async function handleIncomingMessage(
         });
 
     if (outgoingError) {
-      // Meta may already have delivered the response.
-      // Do not send it again automatically.
       console.error(
         "WhatsApp reply delivered but database save failed:",
         outgoingError.message
       );
-
       throw outgoingError;
     }
 
@@ -481,6 +488,13 @@ export async function POST(request: NextRequest) {
         if (change.field !== "messages" || !change.value) {
           continue;
         }
+
+        console.log("WhatsApp webhook event received:", {
+          field: change.field,
+          phoneNumberId:
+            change.value.metadata?.phone_number_id ?? null,
+          messageCount: change.value.messages?.length ?? 0,
+        });
 
         for (const message of change.value.messages || []) {
           await handleIncomingMessage(message, change.value);
