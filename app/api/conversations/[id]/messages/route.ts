@@ -2,6 +2,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { supabaseAdmin } from "@/lib/supabase/admin";
+import { sendWhatsAppMessage } from "@/lib/whatsapp/send-message";
 
 type RouteContext = {
   params: Promise<{ id: string }>;
@@ -55,14 +56,15 @@ async function getOwnedConversation(
   conversationId: string,
   organizationId: string
 ) {
-  // First verify that the conversation belongs to an agent
-  // owned by the authenticated organization.
   const { data: conversation, error } = await supabaseAdmin
     .from("conversations")
     .select(`
       id,
       agent_id,
       visitor_id,
+      visitor_phone,
+      channel,
+      whatsapp_business_account_id,
       status,
       assigned_to,
       human_handover,
@@ -171,8 +173,11 @@ export async function POST(
     const { id } = await params;
 
     const body = await request.json();
+
     const content =
-      typeof body.content === "string" ? body.content.trim() : "";
+      typeof body.content === "string"
+        ? body.content.trim()
+        : "";
 
     if (!content) {
       return NextResponse.json(
@@ -203,13 +208,106 @@ export async function POST(
     if (conversation.status === "resolved") {
       return NextResponse.json(
         {
-          error: "This conversation is resolved. Reopen it before replying.",
+          error:
+            "This conversation is resolved. Reopen it before replying.",
         },
         { status: 409 }
       );
     }
 
-    // Save the human reply.
+    let externalMessageId: string | null = null;
+
+    // Send the reply through WhatsApp Cloud API
+    // only for WhatsApp conversations.
+    if (conversation.channel === "whatsapp") {
+      if (!conversation.whatsapp_business_account_id) {
+        return NextResponse.json(
+          {
+            error:
+              "WhatsApp Business Account is not linked to this conversation.",
+          },
+          { status: 400 }
+        );
+      }
+
+      if (!conversation.visitor_phone) {
+        return NextResponse.json(
+          {
+            error:
+              "Customer WhatsApp phone number is missing from this conversation.",
+          },
+          { status: 400 }
+        );
+      }
+
+      const { data: whatsappAccount, error: accountError } =
+        await supabaseAdmin
+          .from("whatsapp_business_accounts")
+          .select(`
+            id,
+            phone_number_id,
+            access_token_encrypted,
+            connection_status
+          `)
+          .eq("id", conversation.whatsapp_business_account_id)
+          .eq("organization_id", organizationId)
+          .maybeSingle();
+
+      if (accountError) {
+        console.error("WhatsApp account lookup error:", accountError);
+
+        return NextResponse.json(
+          { error: "Unable to retrieve WhatsApp account" },
+          { status: 500 }
+        );
+      }
+
+      if (
+        !whatsappAccount ||
+        whatsappAccount.connection_status !== "connected"
+      ) {
+        return NextResponse.json(
+          {
+            error:
+              "WhatsApp account is not found or disconnected.",
+          },
+          { status: 400 }
+        );
+      }
+
+      try {
+        externalMessageId = await sendWhatsAppMessage({
+          phoneNumberId: whatsappAccount.phone_number_id,
+          encryptedAccessToken:
+            whatsappAccount.access_token_encrypted,
+          recipientPhone: conversation.visitor_phone,
+          message: content,
+        });
+
+        console.log("Human WhatsApp reply sent:", {
+          conversationId: id,
+          externalMessageId,
+        });
+      } catch (whatsappError) {
+        console.error(
+          "WhatsApp outbound message error:",
+          whatsappError
+        );
+
+        return NextResponse.json(
+          {
+            success: false,
+            error:
+              whatsappError instanceof Error
+                ? whatsappError.message
+                : "WhatsApp message could not be sent.",
+          },
+          { status: 502 }
+        );
+      }
+    }
+
+    // Save the message after successful WhatsApp delivery request.
     const { data: message, error: messageError } =
       await supabaseAdmin
         .from("conversation_messages")
@@ -217,23 +315,31 @@ export async function POST(
           conversation_id: id,
           role: "human",
           content,
+          ...(externalMessageId
+            ? { external_message_id: externalMessageId }
+            : {}),
         })
-        .select("id, conversation_id, role, content, created_at")
+        .select(
+          "id, conversation_id, role, content, created_at, external_message_id"
+        )
         .single();
 
     if (messageError || !message) {
       console.error("Save human reply error:", messageError);
 
       return NextResponse.json(
-        { error: "Could not send message" },
+        {
+          success: false,
+          error:
+            "Message was sent, but could not be saved in the conversation.",
+          externalMessageId,
+        },
         { status: 500 }
       );
     }
 
     const now = new Date().toISOString();
 
-    // Enable human handover and assign the conversation
-    // to the current user if it has no existing assignee.
     const updateData: {
       human_handover: boolean;
       status: string;
@@ -262,7 +368,7 @@ export async function POST(
       return NextResponse.json(
         {
           success: false,
-          error: "Message saved, but conversation update failed",
+          error: "Message sent, but conversation update failed.",
           message,
         },
         { status: 500 }
@@ -272,13 +378,19 @@ export async function POST(
     return NextResponse.json({
       success: true,
       message,
+      externalMessageId,
       handover: true,
     });
   } catch (error) {
     console.error("Send conversation reply error:", error);
 
     return NextResponse.json(
-      { error: "Unable to send message" },
+      {
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unable to send message",
+      },
       { status: 500 }
     );
   }
