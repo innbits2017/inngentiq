@@ -1,5 +1,7 @@
+
 import { NextRequest, NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabase/admin";
+import { findOrCreateContact } from "@/lib/contacts/find-or-create-contact";
 
 type RouteParams = {
   params: Promise<{ id: string }>;
@@ -13,7 +15,7 @@ const corsHeaders = (origin: string) => ({
 });
 
 async function getAllowedOrigin(origin: string, id: string) {
-  // Allow requests without an Origin header (same-origin/server requests).
+  // Allow requests without an Origin header.
   if (!origin) return "*";
 
   // Local development.
@@ -138,7 +140,7 @@ export async function POST(
 
     const body = await req.json();
 
-    // Support both normal form submissions and chatbot submissions.
+    // Support normal form and chatbot submissions.
     const formData =
       body.data &&
       typeof body.data === "object" &&
@@ -191,14 +193,16 @@ export async function POST(
         );
       }
 
-      const { data: conversation, error: conversationError } =
-        await supabaseAdmin
-          .from("conversations")
-          .select("id")
-          .eq("id", conversationId)
-          .eq("agent_id", form.agent_id)
-          .eq("visitor_id", visitorId)
-          .maybeSingle();
+      const {
+        data: conversation,
+        error: conversationError,
+      } = await supabaseAdmin
+        .from("conversations")
+        .select("id")
+        .eq("id", conversationId)
+        .eq("agent_id", form.agent_id)
+        .eq("visitor_id", visitorId)
+        .maybeSingle();
 
       if (conversationError || !conversation) {
         return jsonResponse(
@@ -232,17 +236,19 @@ export async function POST(
       formData.requirement ||
       "";
 
-    // Save the raw form submission.
-    const { data: submission, error: submissionError } =
-      await supabaseAdmin
-        .from("form_submissions")
-        .insert({
-          form_id: id,
-          organization_id: form.organization_id,
-          data: formData,
-        })
-        .select()
-        .single();
+    // Save the raw form submission first.
+    const {
+      data: submission,
+      error: submissionError,
+    } = await supabaseAdmin
+      .from("form_submissions")
+      .insert({
+        form_id: id,
+        organization_id: form.organization_id,
+        data: formData,
+      })
+      .select()
+      .single();
 
     if (submissionError) {
       console.error(
@@ -257,12 +263,51 @@ export async function POST(
       );
     }
 
-    // Create CRM lead.
+    // Find or create the master contact.
+    // A contact requires at least an email or phone number.
+    // Forms without either value can still create a lead.
+    let contactId: string | null = null;
+
+    const hasEmail =
+      typeof email === "string" && email.trim() !== "";
+
+    const hasPhone =
+      typeof phone === "string" && phone.trim() !== "";
+
+    if (hasEmail || hasPhone) {
+      try {
+        const result = await findOrCreateContact({
+          organizationId: form.organization_id,
+          name,
+          email,
+          phone,
+          company,
+          source: visitorId ? "chatbot_form" : "website_form",
+          metadata: formData,
+        });
+
+        contactId = result.contact.id;
+      } catch (error) {
+        console.error("Contact creation error:", error);
+
+        return jsonResponse(
+          {
+            error: "Could not create or identify contact.",
+            submissionId: submission.id,
+          },
+          500,
+          allowedOrigin
+        );
+      }
+    }
+
+    // Create CRM lead linked to the master contact.
     const { data: lead, error: leadError } =
       await supabaseAdmin
         .from("leads")
         .insert({
           organization_id: form.organization_id,
+          contact_id: contactId,
           agent_id: form.agent_id,
           form_id: id,
           conversation_id: conversationId,
@@ -286,6 +331,7 @@ export async function POST(
         {
           error: leadError.message,
           submissionId: submission.id,
+          contactId,
         },
         500,
         allowedOrigin
@@ -316,6 +362,7 @@ export async function POST(
         success: true,
         submissionId: submission.id,
         leadId: lead.id,
+        contactId,
         message: "Form submitted successfully",
       },
       200,
